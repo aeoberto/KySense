@@ -65,12 +65,12 @@ ESP8266HTTPUpdateServer httpUpdater;
 
 // You should get Auth Token in the Blynk App.
 // Go to the Project Settings (nut icon).
-char auth[] = "2c4697ac046e411e8beab4e9208c77f0";
+char auth[] = " "; //Blynk token
 
 // Your WiFi credentials.
 // Set password to "" for open networks.
-char ssid[] = "AObertos_H";
-char pass[] = "1991emgj422     ";
+char ssid[] = " "; //Wi-fi network
+char pass[] = " "; //Wi-fi password
 
 // NTP Servers:
 static const char ntpServerName[] = "us.pool.ntp.org";
