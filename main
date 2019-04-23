@@ -1,0 +1,504 @@
+*************************************************************
+          ╔╗╔═╗───╔═══╗
+          ║║║╔╝───║╔═╗║
+          ║╚╝╝╔╗─╔╣╚══╦══╦═╗╔══╦══╗
+          ║╔╗║║║─║╠══╗║║═╣╔╗╣══╣║═╣
+          ║║║╚╣╚═╝║╚═╝║║═╣║║╠══║║═╣
+          ╚╝╚═╩═╗╔╩═══╩══╩╝╚╩══╩══╝
+          ────╔═╝║
+          ────╚══╝
+ *************************************************************/
+#include <TimeLib.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266WebServer.h>
+#include <BlynkSimpleEsp8266.h>
+#include <SPI.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include "EmonLib.h"                   // Include Emon Library
+ 
+#define BLYNK_PRINT Serial
+
+// This is basically the volts per amper ratio of your current measurement sensor.
+// If your sensor has a voltage output it will be written in the sensor enclosure,
+// something like "30V 1A", otherwise it will depend on the burden resistor you are
+// using.
+#define CALIBRATION_CONST        70
+
+// This version of the library only calculate aparent power, so it asumes a fixes
+// mains voltage
+#define MAINS_VOLTAGE           230
+
+////Numbers of samplings
+#define SAMPLING_VALUE          1180
+
+double Irms;
+
+float power_factor = 0.90;
+const int volts = 110;
+
+float clamp1 = 0.00, current1 = 0.00, current1_2 = 0.00;
+float clamp2 = 0.00, current2 = 0.00, current2_2 = 0.00;
+
+int power_w2 = 0, power_w1 = 0;
+float powerMax =0.00, currentMax=0.00, current_T=0.00, power_T=0.00;
+
+String var = "", minutefix = "", secondfix = "";
+
+bool isFirstConnect,flags [20];
+
+long stopwatch;
+int stopwatchTimer, countdownResetCon, countdownResetClock;
+
+float energy,energy2, energyPrice = 0.104, energyCost,energyCost0, current_24h,current_24hCost, past_24h, past_24hCost, 
+lastday_reading,lastday_readingCost, past_30days, past_30daysCost, difference_24hEnergy, difference_30dEnergy;
+
+EnergyMonitor emon1;                   // Create an instance
+
+const char* host = "esp8266"; // will be "esp8266.local/update" in web browser
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
+
+// You should get Auth Token in the Blynk App.
+// Go to the Project Settings (nut icon).
+char auth[] = "2c4697ac046e411e8beab4e9208c77f0";
+
+// Your WiFi credentials.
+// Set password to "" for open networks.
+char ssid[] = "AObertos_H";
+char pass[] = "1991emgj422     ";
+
+// NTP Servers:
+static const char ntpServerName[] = "us.pool.ntp.org";
+//static const char ntpServerName[] = "time.nist.gov";
+//static const char ntpServerName[] = "time-a.timefreq.bldrdoc.gov";
+//static const char ntpServerName[] = "time-b.timefreq.bldrdoc.gov";
+//static const char ntpServerName[] = "time-c.timefreq.bldrdoc.gov";
+
+//const int timeZone = 1;     // Central European Time
+const int timeZone = -5;  // Eastern Standard Time (USA)
+//const int timeZone = -4;  // Eastern Daylight Time (USA)
+//const int timeZone = -8;  // Pacific Standard Time (USA)
+//const int timeZone = -7;  // Pacific Daylight Time (USA)
+
+WiFiUDP Udp;
+unsigned int localPort = 8888;  // local port to listen for UDP packets
+
+time_t getNtpTime();
+void sendNTPpacket(IPAddress &address);
+//-----------------------------------------------------------------------------------------
+// Attach virtual serial terminal to Virtual Pin V1
+WidgetTerminal terminal(V1);
+
+BLYNK_WRITE(V1)
+{
+  var= param.asStr();
+   //Receive Power Factor value
+  if (String("PF") == var.substring(0,2)) {
+    power_factor = (var.substring(3)).toFloat();
+    terminal.println(var.substring(3));
+  }//Receive Energy Cost value
+   else if (String("EC") == var.substring(0,2)) {
+    energyPrice = (var.substring(3)).toFloat();
+    terminal.println(var.substring(3));
+  }
+   else if (String("C") == var.substring(0)){
+    terminal.println("\nWelcome, \n Please, choose one of the options to continue.");
+    terminal.println("\n - To modify 'Power Factor' use >> PF");
+    terminal.println("\n - To modify 'Energy Cost' use >> EC");
+    terminal.println("\n      >>>> Example: AB 1.00 <<<<");
+  }else {
+    // Send it back
+    terminal.print("Invalid Input:");
+    terminal.write(param.getBuffer(), param.getLength());
+    terminal.println();
+  }
+  // Ensure everything is sent
+  terminal.flush();
+}
+
+BlynkTimer timer;
+//-----------------------------------------------------------------------------------------
+// RESET ENERGY COST & RESET CONSUMTION
+BLYNK_WRITE(V20) {
+  if (param.asInt()) {
+    countdownResetCon = timer.setTimeout(1000, []() {
+      Blynk.virtualWrite(V13, "0.000000 kWh");
+      Blynk.virtualWrite(V14, "$0.000000");
+      energy2 = 0;
+      energyCost0 = 0;
+    });
+  } else {
+    timer.disable(countdownResetCon);
+  }
+}
+
+// RESET PEAKS (short) &  RESET STOPWATCH (long)
+BLYNK_WRITE(V21) {
+  if (param.asInt()) {
+    Blynk.virtualWrite(V0, "--- A");
+    Blynk.virtualWrite(V2, "--- W");
+    currentMax = current_T;
+    powerMax = power_T;
+
+    countdownResetClock = timer.setTimeout(1000, []() {
+      Blynk.virtualWrite(V19, "--:--:--:--");
+      stopwatch = 0;
+    });
+  } else {
+    timer.disable(countdownResetClock);
+  }
+}
+//-----------------------------------------------------------------------------------------
+void myTimerEvent(){
+
+  double Irms = emon1.calcIrms(SAMPLING_VALUE);  // Calculate Irms only
+
+  Blynk.virtualWrite(V15, String(Irms,3)+ String(" A"));
+//  Blynk.virtualWrite(V16, String(Irms*volts*power_factor,0)+ String(" W"));
+//
+//  Blynk.virtualWrite(V17, String(Irms,3)+ String(" A"));
+//  Blynk.virtualWrite(V18, String(Irms*volts*power_factor,0)+ String(" W"));
+//
+//  current_T = Irms + Irms;
+//  
+//  power_w1 = abs(volts * Irms * power_factor);
+//  power_w2 = abs(volts * Irms * power_factor);
+//  power_T= power_w1 + power_w2;
+//
+// // ENERGY CONSUMPTION
+//
+//   energy = energy + (( power_w1 + power_w2) / 1000.00/1000.00)/2.177795;  //2.651 //2.3196 //2.2864 //2.2811
+//   energy2 = energy2 + (( power_w1 + power_w2) / 1000.00/1000.00)/2.177795;
+//
+//  Blynk.virtualWrite(V13, String(energy,6) + String (" kWh"));
+//  Blynk.virtualWrite(V27, String(energy2,2) + String (" kWh"));
+//
+// // ENERGY COST
+//
+//  energyCost = (energyPrice * energy);
+//  energyCost0 = (energyPrice * (energy2));
+//  
+//  Blynk.virtualWrite(V14, String ("$") + String(energyCost,6));
+//  Blynk.virtualWrite(V30, String ("$") + String(energyCost0,2));
+}
+//-----------------------------------------------------------------------------------------
+void myTimerEvent1(){
+// CURRENT CLAMP 1 (Graphic 1)
+
+  Blynk.virtualWrite(V6, Irms);
+
+// CURRENT CLAMP 2 (Graphic 1)
+
+  Blynk.virtualWrite(V9, Irms );  
+  
+ // CLAMP 1 POWER (Graphic 1)
+
+  Blynk.virtualWrite(V7, power_w1);
+
+ // CLAMP 2 POWER (Graphic 1)
+
+  Blynk.virtualWrite(V10, power_w2);
+
+// TOTAL CURRENT (Graphic 2)
+
+  Blynk.virtualWrite(V12, current_T);
+
+ // TOTAL POWER (Graphic 2)
+
+  Blynk.virtualWrite(V11, power_T);
+  Blynk.virtualWrite(V22, power_T + String(" W"));
+}
+//-----------------------------------------------------------------------------------------
+void TimerExtrasEvent0(){
+  Blynk.virtualWrite(V1, "\n"
+                     "             ╔╦╗─╔══╗────╔═╗\n"
+                     "             ║╔╬╦╣══╬═╦═╦╣═╬═╗\n"
+                     "             ║╚╣║╠══║╩╣║║╠═║╩╣\n"
+                     "             ╚╩╬╗╠══╩═╩╩═╩═╩═╝\n"
+                     "             ──╚═╝ v.0.2.0 on\n                         " BLYNK_INFO_DEVICE "\n\n");
+  size_t ram = BlynkFreeRam();
+  Blynk.virtualWrite(V1, "\n Free RAM: ", ram,"       Type 'C' for Commands");
+  // digital clock display of the time
+  if (minute() < 10){
+   minutefix =  "0"+String(minute());
+  }else {
+    minutefix = minute();
+  }
+  if (second() < 10){
+   secondfix = "0"+String(second());
+  }else {
+    secondfix = second();
+  }
+  terminal.println ("\n"+String(hour())+":"+String(minutefix)+" "+String(month())+"/"+String(day())+"/"+String(year()));
+  terminal.flush(); 
+
+ // This function is for updaing the MAX values
+  // LOAD CURRENT (PEAK)
+  if (current_T > currentMax) {
+    currentMax = current_T;
+    Blynk.virtualWrite(V0, String((currentMax), 2) + String(" A") );
+    } 
+  // LOAD POWER (PEAK)
+  if (power_T > powerMax) {
+    powerMax = power_T;
+    Blynk.virtualWrite(V2, String((powerMax), 0) + String(" W") );
+  }
+} //":"+String(secondfix)+
+//-----------------------------------------------------------------------------------------
+void TimerExtrasEvent1(){
+  
+//Send energy consumption of the current day, past 24h, and current 30 days.
+  if (flags [2]== false && flags [1] == false){
+    current_24h = energy - lastday_reading;
+    current_24hCost = energyCost - lastday_readingCost;
+    Blynk.virtualWrite(V23, String(current_24h,2)+String(" kWh"));
+    Blynk.virtualWrite(V31, String("$") + String(current_24hCost,2));
+  }
+
+  difference_24hEnergy = past_24h - current_24h;
+  difference_30dEnergy = past_30days - energy; 
+  Blynk.virtualWrite(V36, String(difference_24hEnergy,0)+String(" kWh"));
+  Blynk.virtualWrite(V37, String(difference_30dEnergy,0)+String(" kWh"));
+}
+//-----------------------------------------------------------------------------------------
+void TimerExtrasEvent2(){
+  if (flags [1]== true && flags [2]== false ){ // Flag 1 >> new 24 hours 
+
+    past_24hCost = current_24hCost;
+    past_24h = current_24h; 
+    past_24hCost = current_24hCost;
+    Blynk.virtualWrite(V24, String(past_24h,2)+String(" kWh"));
+    Blynk.virtualWrite(V33, String("$") + String(past_24hCost,2));
+    lastday_reading = energy;
+    lastday_readingCost = energyCost;
+    Blynk.virtualWrite(V26,lastday_reading);
+    Blynk.virtualWrite(V32,lastday_readingCost);
+    flags [1] = false;
+  }
+ 
+  // Clear energy consumption and cost counters after one month
+  if (flags [0] == true){
+    Blynk.virtualWrite(V29, String(past_30days,2)+String(" kWh"));
+    Blynk.virtualWrite(V35, String("$") + String(past_30daysCost,2));
+    Blynk.virtualWrite(V13, "0.000000 kWh");
+    Blynk.virtualWrite(V14, "$0.000000");
+    energy = 0;
+    energyCost = 0;
+    flags [0] = false; 
+  } 
+}
+//-----------------------------------------------------------------------------------------
+// The stopwatch counter which is run on a timer
+void stopwatchCounter() {
+  stopwatch++;
+  long days = 0, hours = 0, mins = 0, secs = 0;
+  String secs_o = ":", mins_o = ":", hours_o = ":";
+  secs = stopwatch; //convect milliseconds to seconds
+  mins = secs / 60; //convert seconds to minutes
+  hours = mins / 60; //convert minutes to hours
+  days = hours / 24; //convert hours to days
+  secs = secs - (mins * 60); //subtract the coverted seconds to minutes in order to display 59 secs max
+  mins = mins - (hours * 60); //subtract the coverted minutes to hours in order to display 59 minutes max
+  hours = hours - (days * 24); //subtract the coverted hours to days in order to display 23 hours max
+  if (secs < 10) secs_o = ":0";
+  if (mins < 10) mins_o = ":0";
+  if (hours < 10) hours_o = ":0";
+  Blynk.virtualWrite(V25,stopwatch);
+  Blynk.virtualWrite(V19, days + hours_o + hours + mins_o + mins + secs_o + secs);
+}
+//-----------------------------------------------------------------------------------------
+void setup()
+{
+  { Serial.begin(115200);
+
+
+    emon1.current(0, CALIBRATION_CONST);             // Current: input pin, calibration.
+   
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, pass);
+    
+    Blynk.begin(auth, ssid, pass);
+
+    ArduinoOTA.setHostname("Basement_plenum_ESP8266_controller");
+    ArduinoOTA.onStart([]()
+    {
+      Serial.println("Start");
+    });
+    ArduinoOTA.onEnd([]()
+    {
+      Serial.println("\nEnd");
+    });
+    ArduinoOTA.begin();
+    Serial.println("Ready - OTA Success!!!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    MDNS.begin(host);
+    httpUpdater.setup(&httpServer);
+    httpServer.begin();
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("HTTPUpdateServer ready! Open http://%s.local/update in your browser\n", host);
+
+    Udp.begin(localPort);
+    setSyncProvider(getNtpTime);
+    setSyncInterval(300);
+    
+    stopwatchTimer = timer.setInterval(1000, stopwatchCounter);
+ 
+    // Setup a function to be called every second
+    timer.setTimeout(200,[](){
+      timer.setInterval(400L, myTimerEvent);
+    });
+    timer.setTimeout(400,[](){
+      timer.setInterval(1000L, myTimerEvent1);
+    });
+    timer.setTimeout(600,[](){
+      timer.setInterval(10000L, TimerExtrasEvent2);
+    });
+    timer.setTimeout(800,[](){
+      timer.setInterval(40000L, TimerExtrasEvent1);
+    });
+    timer.setTimeout(1000,[](){
+      timer.setInterval(60000L, TimerExtrasEvent0);
+    });
+  }
+}
+//-----------------------------------------------------------------------------------------
+void loop()
+{
+  Blynk.run();
+  ArduinoOTA.handle();
+  httpServer.handleClient();
+  timer.run();
+
+  if (hour() == 0 && 0 == minute() && 5 > second()){
+    
+    flags [2]= true;
+    currentMax = 0.00;
+    powerMax = 0;
+    flags [1]= true;
+    if (day() == 1 && hour() == 0 && minute() == 0){
+      past_30days = energy;
+      past_30daysCost = energyCost;
+      flags [0]= true; // Flag 0 >> new month
+    }
+  }else{
+    flags [2]= false; 
+  }
+}
+//-----------------------------------------------------------------------------------------
+// This function will run every time Blynk connection is established
+BLYNK_CONNECTED() {
+  //get data stored in virtual pins from server
+  Blynk.syncVirtual(V13,V14,V23,V24,V25,V26,V27,V29,V30,V31,V32,V33,V35,V36,V37);
+} 
+// 28, 34 free
+// Restoring counter from server
+BLYNK_WRITE(V13) { 
+    energy = param.asFloat();
+}
+BLYNK_WRITE(V14) { 
+    energyCost = param.asFloat();
+}
+BLYNK_WRITE(V23) { 
+    current_24h = param.asFloat();
+}
+BLYNK_WRITE(V24) { 
+    past_24h = param.asFloat();
+}
+BLYNK_WRITE(V29) { 
+    past_30days = param.asFloat();
+}
+BLYNK_WRITE(V25) { 
+    stopwatch = param.asLong();
+}
+BLYNK_WRITE(V26) { 
+    lastday_reading = param.asFloat();
+}
+BLYNK_WRITE(V32) { 
+    lastday_readingCost = param.asFloat();
+}
+BLYNK_WRITE(V27) { 
+    energy2 = param.asFloat();
+}
+BLYNK_WRITE(V30) { 
+    energyCost0 = param.asFloat();
+}
+BLYNK_WRITE(V31) { 
+    current_24hCost = param.asFloat();
+}
+BLYNK_WRITE(V33) { 
+    past_24hCost = param.asFloat();
+}
+BLYNK_WRITE(V35) { 
+    past_30daysCost = param.asFloat();
+}
+BLYNK_WRITE(V36) { 
+    difference_24hEnergy = param.asInt();
+}
+BLYNK_WRITE(V37) { 
+    difference_30dEnergy = param.asInt();
+}
+//-----------------------------------------------------------------------------------------
+/*-------- NTP code ----------*/
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+
+time_t getNtpTime()
+{
+  IPAddress ntpServerIP; // NTP server's ip address
+
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+  Serial.println("Transmit NTP Request");
+  // get a random server from the pool
+  WiFi.hostByName(ntpServerName, ntpServerIP);
+  Serial.print(ntpServerName);
+  Serial.print(": ");
+  Serial.println(ntpServerIP);
+  sendNTPpacket(ntpServerIP);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Serial.println("Receive NTP Response");
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+    }
+  }
+  Serial.println("No NTP Response :-(");
+  return 0; // return 0 if unable to get the time
+}
+//-----------------------------------------------------------------------------------------
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress &address)
+{
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
